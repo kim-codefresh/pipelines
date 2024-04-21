@@ -1,0 +1,1648 @@
+---
+version: "1.0"
+stages:
+- git-clone
+- analysis
+- build-all
+- org-engine-binary
+- org-engine
+- diagnostics
+hooks:
+  on_fail:
+    exec:
+      image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/curlimages/curl@sha256:2bad91c2be32091ca6beaa97a526ed044bf746b5d1d695158297a6b6f6e08640
+      commands:
+      - "if [[ \"${{CF_BRANCH}}\" != \"master\" ]]; then exit 0; fi"
+      - >- # Tell @cloud-devx in #fraas-build that customer-environment has failed to build `master`
+        curl --http1.1
+        -H "Authorization: Bearer ${{SLACK_ACCESS_TOKEN}}"
+        -H 'Content-type: application/json'
+        --data '{"channel": "C9QN94HDK",
+        "thread_ts": "",
+        "type": "mrkdwn",
+        "text": "<!subteam^S04UXSGS5PC> <${{CF_BUILD_URL}}|customer-environment build ${{CF_BUILD_ID}}> has failed on
+        `${{CF_BRANCH}}`\n
+        Commit ${{CF_REVISION}} by ${{CF_COMMIT_AUTHOR}}",
+        "reply_broadcast": "false"}'
+        "https://slack.com/api/chat.postMessage"
+mode: parallel
+steps:
+  #
+  # git-clone steps
+  #
+  main_clone:
+    title: Clone git repos
+    type: parallel
+    stage: git-clone
+    no_cache: false
+    no_cf_cache: true
+    steps:
+      # https://codefresh.io/docs/docs/codefresh-yaml/steps/git-clone/
+      saas_clone:
+        type: git-clone
+        title: Clone saas mono-repo
+        repo: ${{CF_REPO_OWNER}}/${{CF_REPO_NAME}}
+        revision: ${{CF_REVISION}}
+        git: github-app
+      main_clone_platform_images:
+        title: Clone platform-images repo
+        type: git-clone
+        repo: https://stash.forgerock.org/scm/cloud/platform-images.git
+        # WARNING: revision should not be set manually.
+        # To "upgrade" to a later release, see go/common/pkg/identityupdate
+        revision: "ce6d2a7b98a1f00708587e90596b2a8bc3fc26ec"
+        git: bitbucket-server
+      # Prune any reflog entries that point to an unreachable commit or refer to a missing object
+      main_prune_platform_images:
+        title: Prune Reflogs for platform-images
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+        commands:
+        - apk --no-cache add git
+        - test -d ${CF_VOLUME_PATH}/platform-images/.git 2>/dev/null && git --git-dir=${CF_VOLUME_PATH}/platform-images/.git reflog expire --all --stale-fix || true
+      export_variables:
+        title: Export variables
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/codefresh/cli@sha256:edf3baa42bf28c4bf5bada5f8570669897d20355ba644670364fbd621101724c # codefresh/cli
+        commands:
+        - cf_export GOMODCACHE=/codefresh/volume/.gomodcache
+        - cf_export GOCACHE=/codefresh/volume/.gocache
+        - cf_export KUBECTL_VERSION=v1.28.4
+  # Identify the Docker tags to use for workloads deployed by org-engine and decide which, if any, need to be rebuilt
+  GenerateBuildPlan:
+    title: Generate build plan
+    stage: analysis
+    retry:
+      maxAttempts: 2
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/gcloud-tools:1.22.2-alpine3.19@sha256:7bb258ffe96e1fd5a8499ed8d599dd3ec13eb4465597161e2cb122cff3777cda
+    # This step cannot be cached as it updates template helm files packaged by org-engine.
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    commands:
+    - gcloud config set component_manager/disable_update_check true
+    - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+    - gcloud auth activate-service-account codefresh-read-account@fr-pre-prod-registry.iam.gserviceaccount.com --key-file=/tmp/registry-read-key.json
+    - gcloud auth configure-docker us-docker.pkg.dev --quiet
+    - deploy/bin/customer-environment-build-plan.sh
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
+  #
+  # build-all steps
+  #
+  BuildAccessExplainability:
+    title: Build access-explainability
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/access-explainability
+      TRIGGER_ID: access-explainability-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ACCESS_EXPLAINABILITY_TAG='${{ACCESS_EXPLAINABILITY_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ACCESS_EXPLAINABILITY}}' == 'true'"
+  BuildAccessFlexJavaTemplate:
+    title: Build access-flex-java-template
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/access-flex-java-template
+      TRIGGER_ID: access-flex-java-template-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ACCESS_FLEX_JAVA_TEMPLATE_TAG='${{ACCESS_FLEX_JAVA_TEMPLATE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ACCESS_FLEX_JAVA_TEMPLATE}}' == 'true'"
+  BuildAccessFlexPythonTemplate:
+    title: Build access-flex-python-template
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/access-flex-python-template
+      TRIGGER_ID: access-flex-python-template-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ACCESS_FLEX_PYTHON_TEMPLATE_TAG='${{ACCESS_FLEX_PYTHON_TEMPLATE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ACCESS_FLEX_PYTHON_TEMPLATE}}' == 'true'"
+  BuildAiPlatformExporter:
+    title: Build ai-platform-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/ai-platform-exporter
+      TRIGGER_ID: ai-platform-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AI_PLATFORM_EXPORTER_TAG='${{AI_PLATFORM_EXPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AI_PLATFORM_EXPORTER}}' == 'true'"
+  BuildAm:
+    title: Build am
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/am
+      TRIGGER_ID: am-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AM_TAG='${{AM_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM}}' == 'true'"
+  BuildAmConfigUpgrader:
+    title: Build am-config-upgrader
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/am-config-upgrader
+      TRIGGER_ID: am-config-upgrader-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AM_CONFIG_UPGRADER_TAG='${{AM_CONFIG_UPGRADER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM_CONFIG_UPGRADER}}' == 'true'"
+  BuildAmKeystoreCopy:
+    title: Build am-keystore-copy
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/am-keystore-copy
+      TRIGGER_ID: am-keystore-copy-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AM_KEYSTORE_COPY_TAG='${{AM_KEYSTORE_COPY_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AM_KEYSTORE_COPY}}' == 'true'"
+  BuildAutoAccessApi:
+    title: Build auto-access-api
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-access-api
+      TRIGGER_ID: auto-access-api-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_ACCESS_API_TAG='${{AUTO_ACCESS_API_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ACCESS_API}}' == 'true'"
+  BuildAutoAccessDemoDataSeeder:
+    title: Build auto-access-demo-data-seeder
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-access-demo-data-seeder
+      TRIGGER_ID: auto-access-demo-data-seeder-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_ACCESS_DEMO_DATA_SEEDER_TAG='${{AUTO_ACCESS_DEMO_DATA_SEEDER_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ACCESS_DEMO_DATA_SEEDER}}' == 'true'"
+  BuildAutoAnalyticsApi:
+    title: Build auto-analytics-api
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-analytics-api
+      TRIGGER_ID: auto-analytics-api-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_ANALYTICS_API_TAG='${{AUTO_ANALYTICS_API_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ANALYTICS_API}}' == 'true'"
+  BuildAutoAnalyticsEtlJob:
+    title: Build auto-analytics-etl-job
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-analytics-etl-job
+      TRIGGER_ID: auto-analytics-etl-job-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_ANALYTICS_ETL_JOB_TAG='${{AUTO_ANALYTICS_ETL_JOB_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ANALYTICS_ETL_JOB}}' == 'true'"
+  BuildAutoAnalyticsTemplateDataflow:
+    title: Build auto-analytics-template-dataflow
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-analytics-template-dataflow
+      TRIGGER_ID: auto-analytics-template-dataflow-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_ANALYTICS_TEMPLATE_DATAFLOW_TAG='${{AUTO_ANALYTICS_TEMPLATE_DATAFLOW_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_ANALYTICS_TEMPLATE_DATAFLOW}}' == 'true'"
+  BuildAutoStarter:
+    title: Build auto-starter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-starter
+      TRIGGER_ID: auto-starter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_STARTER_TAG='${{AUTO_STARTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_STARTER}}' == 'true'"
+  BuildAutoTerraform:
+    title: Build auto-terraform
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/auto-terraform
+      TRIGGER_ID: auto-terraform-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - AUTO_TERRAFORM_TAG='${{AUTO_TERRAFORM_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_AUTO_TERRAFORM}}' == 'true'"
+  BuildBackupPlatform:
+    title: Build backup-platform
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/backup-platform
+      TRIGGER_ID: backup-platform-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - BACKUP_PLATFORM_TAG='${{BACKUP_PLATFORM_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_BACKUP_PLATFORM}}' == 'true'"
+  BuildCertManager:
+    title: Build cert-manager
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/cert-manager
+      TRIGGER_ID: cert-manager-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - CERT_MANAGER_CONTROLLER_TAG='${{CERT_MANAGER_CONTROLLER_TAG}}'
+      - CERT_MANAGER_WEBHOOK_TAG='${{CERT_MANAGER_WEBHOOK_TAG}}'
+      - CERT_MANAGER_CAINJECTOR_TAG='${{CERT_MANAGER_CAINJECTOR_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: ( '${{BUILD_CERT_MANAGER_CONTROLLER}}' == 'true' ) || ( '${{BUILD_CERT_MANAGER_CAINJECTOR}}' == 'true' ) || ( '${{BUILD_CERT_MANAGER_WEBHOOK}}' == 'true' )
+  BuildCommon:
+    title: Build common
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/common
+      TRIGGER_ID: common-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - COMMON_TAG='${{COMMON_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_COMMON}}' == 'true'"
+  BuildConfigLoader:
+    title: Build config-loader
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/config-loader
+      TRIGGER_ID: config-loader-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - CONFIG_LOADER_TAG='${{CONFIG_LOADER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CONFIG_LOADER}}' == 'true'"
+  BuildConfigSaver:
+    title: Build config-saver
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/config-saver
+      TRIGGER_ID: config-saver-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - CONFIG_SAVER_TAG='${{CONFIG_SAVER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CONFIG_SAVER}}' == 'true'"
+  BuildCtsStore:
+    title: Build ctsstore
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/ctsstore
+      TRIGGER_ID: ctsstore-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - CTSSTORE_TAG='${{CTSSTORE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_CTSSTORE}}' == 'true'"
+  BuildEdgedelta:
+    title: Build edgedelta
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/edgedelta
+      TRIGGER_ID: edgedelta-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - EDGEDELTA_TAG='${{EDGEDELTA_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_EDGEDELTA}}' == 'true'"
+  BuildElasticsearchExporter:
+    title: Build elasticsearch-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/elasticsearch-exporter
+      TRIGGER_ID: elasticsearch-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ELASTICSEARCH_EXPORTER_TAG='${{ELASTICSEARCH_EXPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ELASTICSEARCH_EXPORTER}}' == 'true'"
+  BuildEtlDataflowTemplate:
+    title: Build etl-dataflow-template
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/etl-dataflow-template
+      TRIGGER_ID: etl-dataflow-template-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ETL_DATAFLOW_TEMPLATE_TAG='${{ETL_DATAFLOW_TEMPLATE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ETL_DATAFLOW_TEMPLATE}}' == 'true'"
+  BuildEtlRunner:
+    title: Build etl-runner
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/etl-runner
+      TRIGGER_ID: etl-runner-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ETL_RUNNER_TAG='${{ETL_RUNNER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ETL_RUNNER}}' == 'true'"
+  BuildFbcTools:
+    title: Build fbc-tools
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/fbc-tools
+      TRIGGER_ID: fbc-tools-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - FBC_TOOLS_TAG='${{FBC_TOOLS_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_FBC_TOOLS}}' == 'true'"
+  BuildGatekeeper:
+    title: Build gatekeeper
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/gatekeeper
+      TRIGGER_ID: gatekeeper-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - GATEKEEPER_TAG='${{GATEKEEPER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_GATEKEEPER}}' == 'true'"
+  BuildGcpOidcTokenProxy:
+    title: Build gcp-oidc-token-proxy
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/gcp-oidc-token-proxy
+      TRIGGER_ID: gcp-oidc-token-proxy-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - GCP_OIDC_TOKEN_PROXY_TAG='${{GCP_OIDC_TOKEN_PROXY_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_GCP_OIDC_TOKEN_PROXY}}' == 'true'"
+  BuildHaproxy:
+    title: Build haproxy
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/haproxy
+      TRIGGER_ID: haproxy-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - HAPROXY_TAG='${{HAPROXY_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_HAPROXY}}' == 'true'"
+  BuildIdm:
+    title: Build idm
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/idm
+      TRIGGER_ID: idm-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - IDM_TAG='${{IDM_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_IDM}}' == 'true'"
+  BuildIgaApi:
+    title: Build iga-api
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/iga-api
+      TRIGGER_ID: iga-api-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - IGA_API_TAG='${{IGA_API_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_IGA_API}}' == 'true'"
+  BuildIgaInit:
+    title: Build iga-init
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/iga-init
+      TRIGGER_ID: iga-init-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - IGA_INIT_TAG='${{IGA_INIT_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_IGA_INIT}}' == 'true'"
+  BuildIntezer:
+    title: Build intezer
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/intezer
+      TRIGGER_ID: intezer-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - INTEZER_TAG='${{INTEZER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_INTEZER}}' == 'true'"
+  BuildJas:
+    title: Build jas
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/jas
+      TRIGGER_ID: jas-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - JAS_TAG='${{JAS_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_JAS}}' == 'true'"
+  BuildKeystoresCreate:
+    title: Build keystores-create
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/keystores-create
+      TRIGGER_ID: keystores-create-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - KEYSTORES_CREATE_TAG='${{KEYSTORES_CREATE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_KEYSTORES_CREATE}}' == 'true'"
+  BuildKubeStateMetrics:
+    title: Build kube-state-metrics
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/kube-state-metrics
+      TRIGGER_ID: kube-state-metrics-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - KUBE_STATE_METRICS_TAG='${{KUBE_STATE_METRICS_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_KUBE_STATE_METRICS}}' == 'true'"
+  BuildLdifImporter:
+    title: Build ldif-importer
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/ldif-importer
+      TRIGGER_ID: ldif-importer-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - LDIF_IMPORTER_TAG='${{LDIF_IMPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_LDIF_IMPORTER}}' == 'true'"
+  BuildMonIdentitiesExporter:
+    title: Build mon-identities-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/mon-identities-exporter
+      TRIGGER_ID: mon-identities-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - MON_IDENTITIES_EXPORTER_TAG='${{MON_IDENTITIES_EXPORTER_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_IDENTITIES_EXPORTER}}' == 'true'"
+  BuildMonMetadataExporter:
+    title: Build mon-metadata-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/mon-metadata-exporter
+      TRIGGER_ID: mon-metadata-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - MON_METADATA_EXPORTER_TAG='${{MON_METADATA_EXPORTER_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_METADATA_EXPORTER}}' == 'true'"
+  BuildMonPingdomExporter:
+    title: Build mon-pingdom-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/mon-pingdom-exporter
+      TRIGGER_ID: mon-pingdom-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - MON_PINGDOM_EXPORTER_TAG='${{MON_PINGDOM_EXPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_MON_PINGDOM_EXPORTER}}' == 'true'"
+  BuildOrgBootstrapper:
+    title: Build org-bootstrapper
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-bootstrapper
+      TRIGGER_ID: org-bootstrapper-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_BOOTSTRAPPER_TAG='${{ORG_BOOTSTRAPPER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_BOOTSTRAPPER}}' == 'true'"
+  BuildOrgEnvironment:
+    title: Build org-environment
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-environment
+      TRIGGER_ID: org-environment-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_ENVIRONMENT_TAG='${{ORG_ENVIRONMENT_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ENVIRONMENT}}' == 'true'"
+  BuildOrgEsv:
+    title: Build org-esv
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-esv
+      TRIGGER_ID: org-esv-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_ESV_TAG='${{ORG_ESV_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ESV}}' == 'true'"
+  BuildOrgFilter:
+    title: Build org-filter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-filter
+      TRIGGER_ID: org-filter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_FILTER_TAG='${{ORG_FILTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_FILTER}}' == 'true'"
+  BuildOrgLogSpewer:
+    title: Build org-log-spewer
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-log-spewer
+      TRIGGER_ID: org-log-spewer-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_LOG_SPEWER_TAG='${{ORG_LOG_SPEWER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_LOG_SPEWER}}' == 'true'"
+  BuildOrgOrchAgent:
+    title: Build org-orch-agent
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-orch-agent
+      TRIGGER_ID: org-orch-agent-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_ORCH_AGENT_TAG='${{ORG_ORCH_AGENT_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ORCH_AGENT}}' == 'true'"
+  BuildOrgPromo:
+    title: Build org-promo
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/org-promo
+      TRIGGER_ID: org-promo-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ORG_PROMO_TAG='${{ORG_PROMO_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_PROMO}}' == 'true'"
+  BuildPatchConfig:
+    title: Build patch-config
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/patch-config
+      TRIGGER_ID: patch-config-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PATCH_CONFIG_TAG='${{PATCH_CONFIG_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PATCH_CONFIG}}' == 'true'"
+  BuildPlatformUi:
+    title: Build platform-ui
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/platform-ui
+      TRIGGER_ID: platform-ui-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PLATFORM_UI_TAG='${{PLATFORM_UI_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PLATFORM_UI}}' == 'true'"
+  BuildPrometheus:
+    title: Build prometheus
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/prometheus
+      TRIGGER_ID: prometheus-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PROMETHEUS_TAG='${{PROMETHEUS_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS}}' == 'true'"
+  BuildPrometheusBlackboxExporter:
+    title: Build prometheus-blackbox-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/prometheus-blackbox-exporter
+      TRIGGER_ID: prometheus-blackbox-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PROMETHEUS_BLACKBOX_EXPORTER_TAG='${{PROMETHEUS_BLACKBOX_EXPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_BLACKBOX_EXPORTER}}' == 'true'"
+  BuildPrometheusJsonExporter:
+    title: Build prometheus-json-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/prometheus-json-exporter
+      TRIGGER_ID: prometheus-json-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PROMETHEUS_JSON_EXPORTER_TAG='${{PROMETHEUS_JSON_EXPORTER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_JSON_EXPORTER}}' == 'true'"
+  BuildPrometheusNodeExporter:
+    title: Build prometheus-node-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/prometheus-node-exporter
+      TRIGGER_ID: prometheus-node-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PROMETHEUS_NODE_EXPORTER_TAG='${{PROMETHEUS_NODE_EXPORTER_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_NODE_EXPORTER}}' == 'true'"
+  BuildPrometheusStackdriverExporter:
+    title: Build prometheus-stackdriver-exporter
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/prometheus-stackdriver-exporter
+      TRIGGER_ID: prometheus-stackdriver-exporter-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PROMETHEUS_STACKDRIVER_EXPORTER_TAG='${{PROMETHEUS_STACKDRIVER_EXPORTER_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PROMETHEUS_STACKDRIVER_EXPORTER}}' == 'true'"
+  BuildPushGateway:
+    title: Build push-gateway
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/push-gateway
+      TRIGGER_ID: push-gateway-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - PUSH_GATEWAY_TAG='${{PUSH_GATEWAY_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_PUSH_GATEWAY}}' == 'true'"
+  BuildTenancyInitializer:
+    title: Build tenancy-initializer
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/tenancy-initializer
+      TRIGGER_ID: tenancy-initializer-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - TENANCY_INITIALIZER_TAG='${{TENANCY_INITIALIZER_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_TENANCY_INITIALIZER}}' == 'true'"
+  BuildThanos:
+    title: Build thanos
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/thanos
+      TRIGGER_ID: thanos-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - THANOS_TAG='${{THANOS_TAG}}'
+      - FLOATING_IMAGE_TAG='${{FLOATING_IMAGE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_THANOS}}' == 'true'"
+  BuildUnlockLiquibase:
+    title: Build unlock-liquibase
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/unlock-liquibase
+      TRIGGER_ID: unlock-liquibase-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - UNLOCK_LIQUIBASE_TAG='${{UNLOCK_LIQUIBASE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_UNLOCK_LIQUIBASE}}' == 'true'"
+  BuildUserstore:
+    title: Build userstore
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/userstore
+      TRIGGER_ID: userstore-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - USERSTORE_TAG='${{USERSTORE_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_USERSTORE}}' == 'true'"
+  BuildUtil:
+    title: Build util
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/util
+      TRIGGER_ID: util-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - UTIL_TAG='${{UTIL_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_UTIL}}' == 'true'"
+  BuildWorkloadIdentityInit:
+    title: Build workload-identity-init
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/workload-identity-init
+      TRIGGER_ID: workload-identity-init-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - WORKLOAD_IDENTITY_INIT_TAG='${{WORKLOAD_IDENTITY_INIT_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_WORKLOAD_IDENTITY_INIT}}' == 'true'"
+  BuildZoranApi:
+    title: Build zoran-api
+    stage: build-all
+    type: codefresh-run
+    no_cache: false
+    no_cf_cache: true
+    arguments:
+      PIPELINE_ID: ForgeCloud/saas/zoran-api
+      TRIGGER_ID: zoran-api-trigger
+      BRANCH: '${{CF_BRANCH}}'
+      SHA: '${{CF_REVISION}}'
+      VARIABLE:
+      - ZORAN_API_TAG='${{ZORAN_API_TAG}}'
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ZORAN_API}}' == 'true'"
+  BuildAllCompleted:
+    title: Completed
+    stage: build-all
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+    commands:
+    - echo "AM_CONFIG_UPGRADER_TAG='${{AM_CONFIG_UPGRADER_TAG}}'"
+    - echo "LDIF_IMPORTER_TAG='${{LDIF_IMPORTER_TAG}}'"
+    when:
+      condition:
+        all:
+          buildPlanCompleted: steps.GenerateBuildPlan.result == 'success'
+          accessExplainabilityCompleted: ( steps.BuildAccessExplainability.result == 'success' ) || ( '${{BUILD_ACCESS_EXPLAINABILITY}}' == 'false' )
+          accessFlexJavaTemplateCompleted: ( steps.BuildAccessFlexJavaTemplate.result == 'success' ) || ( '${{BUILD_ACCESS_FLEX_JAVA_TEMPLATE}}' == 'false' )
+          accessFlexPythonTemplateCompleted: ( steps.BuildAccessFlexPythonTemplate.result == 'success' ) || ( '${{BUILD_ACCESS_FLEX_PYTHON_TEMPLATE}}' == 'false' )
+          aiPlatformExporterCompleted: ( steps.BuildAiPlatformExporter.result == 'success' ) || ( '${{BUILD_AI_PLATFORM_EXPORTER}}' == 'false' )
+          amCompleted: ( steps.BuildAm.result == 'success' ) || ( '${{BUILD_AM}}' == 'false' )
+          amConfigUpgraderCompleted: ( steps.BuildAmConfigUpgrader.result == 'success' ) || ( '${{BUILD_AM_CONFIG_UPGRADER}}' == 'false' )
+          amKeystoreCopyCompleted: ( steps.BuildAmKeystoreCopy.result == 'success' ) || ( '${{BUILD_AM_KEYSTORE_COPY}}' == 'false' )
+          autoAccessApiCompleted: ( steps.BuildAutoAccessApi.result == 'success' ) || ( '${{BUILD_AUTO_ACCESS_API}}' == 'false' )
+          autoAccessDemoDataSeederCompleted: ( steps.BuildAutoAccessDemoDataSeeder.result == 'success' ) || ( '${{BUILD_AUTO_ACCESS_DEMO_DATA_SEEDER}}' == 'false' )
+          autoAnalyticsApiCompleted: ( steps.BuildAutoAnalyticsApi.result == 'success' ) || ( '${{BUILD_AUTO_ANALYTICS_API}}' == 'false' )
+          autoAnalyticsEtlJobCompleted: ( steps.BuildAutoAnalyticsEtlJob.result == 'success' ) || ( '${{BUILD_AUTO_ANALYTICS_ETL_JOB}}' == 'false' )
+          autoAnalyticsTemplateDataflowCompleted: ( steps.BuildAutoAnalyticsTemplateDataflow.result == 'success' ) || ( '${{BUILD_AUTO_ANALYTICS_TEMPLATE_DATAFLOW}}' == 'false' )
+          autoStarterCompleted: ( steps.BuildAutoStarter.result == 'success' ) || ( '${{BUILD_AUTO_STARTER}}' == 'false' )
+          autoTerraformCompleted: ( steps.BuildAutoTerraform.result == 'success' ) || ( '${{BUILD_AUTO_TERRAFORM}}' == 'false' )
+          backupPlatformCompleted: ( steps.BuildBackupPlatform.result == 'success' ) || ( '${{BUILD_BACKUP_PLATFORM}}' == 'false' )
+          certManagerCompleted: ( steps.BuildCertManager.result == 'success' ) || ( ( '${{BUILD_CERT_MANAGER_CONTROLLER}}' == 'false' ) && ( '${{BUILD_CERT_MANAGER_CAINJECTOR}}' == 'false' ) && ( '${{BUILD_CERT_MANAGER_WEBHOOK}}' == 'false' ) )
+          commonCompleted: ( steps.BuildCommon.result == 'success' ) || ( '${{BUILD_COMMON}}' == 'false' )
+          configLoaderCompleted: ( steps.BuildConfigLoader.result == 'success' ) || ( '${{BUILD_CONFIG_LOADER}}' == 'false' )
+          configSaverCompleted: ( steps.BuildConfigSaver.result == 'success' ) || ( '${{BUILD_CONFIG_SAVER}}' == 'false' )
+          ctsstoreCompleted: ( steps.BuildCtsStore.result == 'success' ) || ( '${{BUILD_CTSSTORE}}' == 'false' )
+          edgedeltaCompleted: ( steps.BuildEdgedelta.result == 'success' ) || ( '${{BUILD_EDGEDELTA}}' == 'false' )
+          elasticsearchExporterCompleted: ( steps.BuildElasticsearchExporter.result == 'success' ) || ( '${{BUILD_ELASTICSEARCH_EXPORTER}}' == 'false' )
+          etlDataflowTemplateCompleted: ( steps.BuildEtlDataflowTemplate.result == 'success' ) || ( '${{BUILD_ETL_DATAFLOW_TEMPLATE}}' == 'false' )
+          etlRunnerCompleted: ( steps.BuildEtlRunner.result == 'success' ) || ( '${{BUILD_ETL_RUNNER}}' == 'false' )
+          fbcToolsCompleted: ( steps.BuildFbcTools.result == 'success' ) || ( '${{BUILD_FBC_TOOLS}}' == 'false' )
+          gatekeeperCompleted: ( steps.BuildGatekeeper.result == 'success' ) || ( '${{BUILD_GATEKEEPER}}' == 'false' )
+          gcpOidcTokenProxyCompleted: ( steps.BuildGcpOidcTokenProxy.result == 'success' ) || ( '${{BUILD_GCP_OIDC_TOKEN_PROXY}}' == 'false' )
+          haproxyCompleted: ( steps.BuildHaproxy.result == 'success' ) || ( '${{BUILD_HAPROXY}}' == 'false' )
+          idmCompleted: ( steps.BuildIdm.result == 'success' ) || ( '${{BUILD_IDM}}' == 'false' )
+          igaApiCompleted: ( steps.BuildIgaApi.result == 'success' ) || ( '${{BUILD_IGA_API}}' == 'false' )
+          igaInitCompleted: ( steps.BuildIgaInit.result == 'success' ) || ( '${{BUILD_IGA_INIT}}' == 'false' )
+          intezerCompleted: ( steps.BuildIntezer.result == 'success' ) || ( '${{BUILD_INTEZER}}' == 'false' )
+          jasCompleted: ( steps.BuildJas.result == 'success' ) || ( '${{BUILD_JAS}}' == 'false' )
+          keystoresCreateCompleted: ( steps.BuildKeystoresCreate.result == 'success' ) || ( '${{BUILD_KEYSTORES_CREATE}}' == 'false' )
+          kubeStateMetricsComplete: ( steps.BuildKubeStateMetrics.result == 'success' ) || ( '${{BUILD_KUBE_STATE_METRICS}}' == 'false' )
+          ldifImporterCompleted: ( steps.BuildLdifImporter.result == 'success' ) || ( '${{BUILD_LDIF_IMPORTER}}' == 'false' )
+          monIdentitiesExporterCompleted: ( steps.BuildMonIdentitiesExporter.result == 'success' ) || ( '${{BUILD_MON_IDENTITIES_EXPORTER}}' == 'false' )
+          monMetadataExporterCompleted: ( steps.BuildMonMetadataExporter.result == 'success' ) || ( '${{BUILD_MON_METADATA_EXPORTER}}' == 'false' )
+          monPingdomExporterCompleted: ( steps.BuildMonPingdomExporter.result == 'success' ) || ( '${{BUILD_MON_PINGDOM_EXPORTER}}' == 'false' )
+          orgBootstrapperCompleted: ( steps.BuildOrgBootstrapper.result == 'success' ) || ( '${{BUILD_ORG_BOOTSTRAPPER}}' == 'false' )
+          orgEnvironmentCompleted: ( steps.BuildOrgEnvironment.result == 'success' ) || ( '${{BUILD_ORG_ENVIRONMENT}}' == 'false' )
+          orgEsvCompleted: ( steps.BuildOrgEsv.result == 'success' ) || ( '${{BUILD_ORG_ESV}}' == 'false' )
+          orgFilterCompleted: ( steps.BuildOrgFilter.result == 'success' ) || ( '${{BUILD_ORG_FILTER}}' == 'false' )
+          orgLogSpewerCompleted: ( steps.BuildOrgLogSpewer.result == 'success' ) || ( '${{BUILD_ORG_LOG_SPEWER}}' == 'false' )
+          orgOrchAgentCompleted: ( steps.BuildOrgOrchAgent.result == 'success' ) || ( '${{BUILD_ORG_ORCH_AGENT}}' == 'false' )
+          orgPromoCompleted: ( steps.BuildOrgPromo.result == 'success' ) || ( '${{BUILD_ORG_PROMO}}' == 'false' )
+          patchConfigCompleted: ( steps.BuildPatchConfig.result == 'success' ) || ( '${{BUILD_PATCH_CONFIG}}' == 'false' )
+          platformUiCompleted: ( steps.BuildPlatformUi.result == 'success' ) || ( '${{BUILD_PLATFORM_UI}}' == 'false' )
+          prometheusBlackboxExporterCompleted: ( steps.BuildPrometheusBlackboxExporter.result == 'success' ) || ( '${{BUILD_PROMETHEUS_BLACKBOX_EXPORTER}}' == 'false' )
+          prometheusCompleted: ( steps.BuildPrometheus.result == 'success' ) || ( '${{BUILD_PROMETHEUS}}' == 'false' )
+          prometheusJsonExporterCompleted: ( steps.BuildPrometheusJsonExporter.result == 'success' ) || ( '${{BUILD_PROMETHEUS_JSON_EXPORTER}}' == 'false' )
+          prometheusNodeExporterCompleted: ( steps.BuildPrometheusNodeExporter.result == 'success' ) || ( '${{BUILD_PROMETHEUS_NODE_EXPORTER}}' == 'false' )
+          prometheusStackdriverExporterCompleted: ( steps.BuildPrometheusStackdriverExporter.result == 'success' ) || ( '${{BUILD_PROMETHEUS_STACKDRIVER_EXPORTER}}' == 'false' )
+          pushGatewayCompleted: ( steps.BuildPushGateway.result == 'success' ) || ( '${{BUILD_PUSH_GATEWAY}}' == 'false' )
+          tenancyInitializerCompleted: ( steps.BuildTenancyInitializer.result == 'success' ) || ( '${{BUILD_TENANCY_INITIALIZER}}' == 'false' )
+          thanosCompleted: ( steps.BuildThanos.result == 'success' ) || ( '${{BUILD_THANOS}}' == 'false' )
+          unlockLiquibaseCompleted: ( steps.BuildUnlockLiquibase.result == 'success' ) || ( '${{BUILD_UNLOCK_LIQUIBASE}}' == 'false' )
+          userstoreCompleted: ( steps.BuildUserstore.result == 'success' ) || ( '${{BUILD_USERSTORE}}' == 'false' )
+          utilCompleted: ( steps.BuildUtil.result == 'success' ) || ( '${{BUILD_UTIL}}' == 'false' )
+          workloadIdentityInitCompleted: ( steps.BuildWorkloadIdentityInit.result == 'success' ) || ( '${{BUILD_WORKLOAD_IDENTITY_INIT}}' == 'false' )
+          zoranApiCompleted: ( steps.BuildZoranApi.result == 'success' ) || ( '${{BUILD_ZORAN_API}}' == 'false' )
+  #
+  # org-engine-binary steps
+  #
+  BuildEngineBinaryTestImage:
+    title: Build Testing Image
+    stage: org-engine-binary
+    type: build
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    no_cache: false
+    no_cf_cache: true
+    image_name: org-engine-test
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/binary.Dockerfile
+    tag: ${{FLOATING_IMAGE_TAG}}
+    target: source
+    build_arguments:
+    - GOCACHE=${{GOCACHE}}
+    when:
+      condition:
+        all:
+          parentCompleted: steps.GenerateBuildPlan.result == 'success'
+          needToBuild: "'${{BUILD_ORG_ENGINE_BINARY}}' == 'true'"
+  TestEngine:
+    type: parallel
+    stage: org-engine-binary
+    no_cache: false
+    no_cf_cache: true
+    title: Run unit tests
+    retry:
+      maxAttempts: 2
+    steps:
+      RunEngineBinaryUnitTests:
+        title: Run Unit Tests
+        image: ${{BuildEngineBinaryTestImage}}
+        working_directory: /go/src/github.com/ForgeCloud/saas/go/services/customer/org-engine
+        commands:
+        - go test -p 1 ./...
+    when:
+      steps:
+      - name: BuildEngineBinaryTestImage
+        on:
+        - success
+  BuildEngineBinaryImage:
+    title: Build Binary Image
+    stage: org-engine-binary
+    type: build
+    no_cache: false
+    no_cf_cache: true
+    retry:
+      maxAttempts: 2
+    buildkit: true
+    image_name: fr-pre-prod-registry/container-images/org-engine-binary-only
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/binary.Dockerfile
+    tag: ${{ORG_ENGINE_BINARY_TAG}}
+    build_arguments:
+    - GOMODCACHE=${{GOMODCACHE}}
+    - GOCACHE=${{GOCACHE}}
+    when:
+      steps:
+      - name: TestEngine
+        on:
+        - success
+  PushEngineBinaryToDockerRegistryAmerica: &org_engine_binary_registry_push
+    title: Push to Artifact Registry
+    stage: org-engine-binary
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine-binary
+    candidate: ${{BuildEngineBinaryImage}}
+    tags:
+    - ${{ORG_ENGINE_BINARY_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: BuildEngineBinaryImage
+        on:
+        - success
+  PushEngineBinaryToDockerRegistryEurope:
+    <<: *org_engine_binary_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine-binary
+    registry: fr-pre-prod-registry-emea
+  PushEngineBinaryToDockerRegistryAsia:
+    <<: *org_engine_binary_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine-binary
+    registry: fr-pre-prod-registry-asia
+  EngineBinaryStageCompleted:
+    title: Completed
+    stage: org-engine-binary
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+    commands:
+    - echo "Docker tag=${{ORG_ENGINE_BINARY_TAG}}"
+    when:
+      condition:
+        any:
+          parentCompleted: ( steps.PushEngineBinaryToDockerRegistryAmerica.result == 'success' ) && ( steps.PushEngineBinaryToDockerRegistryEurope.result == 'success' ) && ( steps.PushEngineBinaryToDockerRegistryAsia.result == 'success' )
+          skipBuild: "'${{BUILD_ORG_ENGINE_BINARY}}' == 'false'"
+  #
+  # org-engine steps
+  #
+  BuildLocalBinaries:
+    type: parallel
+    title: Build CI image and binaries
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
+    steps:
+      PackageLocal:
+        title: Package Local Binary
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/go-build-base:1.22.2-alpine3.19@sha256:028246a925667aba614fd5d9f8edcbf16c2d143e581e56779b17b7b6c72a8488
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        buildkit: true
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+        commands:
+        - go build -o /codefresh/volume/package_local /codefresh/volume/saas/go/services/customer/org-engine/cmd/package_local/*.go
+      EngineChecker:
+        title: Engine Checker Binary
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/go-build-base:1.22.2-alpine3.19@sha256:028246a925667aba614fd5d9f8edcbf16c2d143e581e56779b17b7b6c72a8488
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        buildkit: true
+        build_arguments:
+        - GOCACHE=${{GOCACHE}}
+        commands:
+        - go build -o /codefresh/volume/engine-checker /codefresh/volume/saas/go/utilities/engine-checker/
+  PackageConfigs:
+    title: Packaging configs
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+    working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+    commands:
+    - rm -rf ./packaged-config
+    - /codefresh/volume/package_local package_config --saas_dir=/codefresh/volume/saas --package_into=/codefresh/volume/saas/go/services/customer/org-engine/packaged-config
+    when:
+      steps:
+      - name: GenerateBuildPlan
+        on:
+        - success
+      - name: BuildLocalBinaries
+        on:
+        - success
+  CheckKustomizeConfigs:
+    type: parallel
+    title: Check configs
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    steps:
+      CheckPackagedConfigs:
+        title: check packaged configs
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+        working_directory: /codefresh/volume/saas/go/services/customer/org-engine
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+        - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/registry-read-key.json
+        - /codefresh/volume/engine-checker check-folder /codefresh/volume/saas/go/services/customer/org-engine/packaged-config
+      CheckKustomize:
+        title: Check Kustomize
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+        working_directory: /codefresh/volume/saas/deploy/kustomize
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - apk add --update bash
+        - mkdir -p /codefresh/volume/saas/go/services/customer/org-engine/image-lists
+        - echo $PRE_PROD_REGISTRY_READ_KEY_JSON > /tmp/registry-read-key.json
+        - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/registry-read-key.json
+        - bash -c "ls -d base/*/kustomization.{yaml,tmpl.yaml} overlays/*/kustomization.{yaml,tmpl.yaml} gatekeeper/kustomization.yaml | sed -r 's/.kustomization.(yaml|tmpl.yaml)$//g' > /tmp/kust_dirs.txt"
+        - while read -r DIR; do echo "kustomizing ${DIR}"; /codefresh/volume/package_local kustomization --saas_dir=/codefresh/volume/saas --kustomize_config=$DIR 2>> /tmp/manifest.images; done < /tmp/kust_dirs.txt
+        - /codefresh/volume/engine-checker check-kustomization /tmp/manifest.images /codefresh/volume/saas/go/services/customer/org-engine/image-lists/manifest.list
+      CheckEngineersKey:
+        title: Check the engineer-keyring is valid
+        image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+        working_directory: /codefresh/volume/saas/deploy/kustomize/base/engineers-keyring
+        no_cache: false
+        no_cf_cache: true
+        commands:
+        - apk add --update gpg yq bash
+        - bash -c ./validate-keyring.sh
+    when:
+      steps:
+      - name: PackageConfigs
+        on:
+        - success
+      - name: EngineBinaryStageCompleted
+        on:
+        - success
+      - name: BuildAllCompleted
+        on:
+        - success
+  GetGitToken:
+    title: Reading Github token
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/codefresh/cli@sha256:edf3baa42bf28c4bf5bada5f8570669897d20355ba644670364fbd621101724c # codefresh/cli
+    commands:
+    - cf_export GITHUB_AUTH_TOKEN=$(codefresh get context github-app --decrypt -o yaml | yq -r .spec.data.auth.password)
+  GenerateBuildNumberTag:
+    title: Generate build number tag
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/gcloud-tools:1.22.2-alpine3.19@sha256:7bb258ffe96e1fd5a8499ed8d599dd3ec13eb4465597161e2cb122cff3777cda
+    working_directory: /codefresh/volume/saas
+    fail_fast: false
+    environment:
+    - BRANCH=${{FLOATING_IMAGE_TAG}}
+    commands:
+    - deploy/bin/generate-build-number-tag.sh org-engine $BRANCH $CF_REVISION
+    when:
+      steps:
+      - name: CheckKustomizeConfigs
+        on:
+        - success
+  # This step will fail if the branch needs tag ordering and the floating tag has already been applied to a
+  # subsequent commit.
+  BuildEngineImage:
+    title: Build Deployment Image
+    stage: org-engine
+    type: build
+    retry:
+      maxAttempts: 2
+    no_cache: false
+    no_cf_cache: true
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    working_directory: /codefresh/volume/saas/
+    dockerfile: go/services/customer/org-engine/deploy.Dockerfile
+    tag: ${{FLOATING_IMAGE_TAG}}
+    build_arguments:
+    - BINARY_TAG=${{ORG_ENGINE_BINARY_TAG}}
+    - DOCKER_IMAGE_TAG="${{STATIC_IMAGE_TAG}}"
+    - KUBECTL_VERSION=${{KUBECTL_VERSION}}
+    - ARTIFACTORY_API_KEY=${{ARTIFACTORY_API_KEY}}
+    - RELEASE_VERSION=${{BUILD_NUMBER}}
+    when:
+      steps:
+      - name: GenerateBuildNumberTag
+        on:
+        - success
+  ShouldAddFloatingTag:
+    title: Should add floating tag
+    stage: org-engine
+    no_cache: false
+    no_cf_cache: true
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/gcloud-tools:1.22.2-alpine3.19@sha256:7bb258ffe96e1fd5a8499ed8d599dd3ec13eb4465597161e2cb122cff3777cda
+    working_directory: /codefresh/volume/saas
+    fail_fast: false
+    commands:
+    # always add floating tag for non-master branches
+    - if [ "$BRANCH" != master ]; then exit 0; fi
+    # only add floating tag if this is the latest commit
+    - deploy/bin/check-head-after-floating-tag.sh org-engine $BRANCH
+    environment:
+    - BRANCH=${{FLOATING_IMAGE_TAG}}
+    - PRE_PROD_REGISTRY_READ_KEY_JSON=${{PRE_PROD_REGISTRY_READ_KEY_JSON}}
+    when:
+      steps:
+      - name: BuildEngineImage
+        on:
+        - success
+  # Push the org-engine container with both static and floating tags - do this only
+  #   if the floating tag is currently on an earlier commit, or if not on master.
+  PushEngineToDockerRegistryAmericaWithFloatingTag: &org_engine_tag_registry_push
+    title: Push floating tag to Artifact Registry
+    type: push
+    stage: org-engine
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    candidate: ${{BuildEngineImage}}
+    tags:
+    - ${{FLOATING_IMAGE_TAG}}
+    - ${{STATIC_IMAGE_TAG}}
+    - ${{BUILD_NUMBER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: ShouldAddFloatingTag
+        on:
+        - success
+  PushEngineToDockerRegistryEuropeWithFloatingTag:
+    <<: *org_engine_tag_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine
+    registry: fr-pre-prod-registry-emea
+  PushEngineToDockerRegistryAsiaWithFloatingTag:
+    <<: *org_engine_tag_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine
+    registry: fr-pre-prod-registry-asia
+  # Push the org-engine container with only a static tag. Do this if on master
+  #   and the floating tag is on a subsequent commit.
+  PushEngineToDockerRegistryAmericaWithoutFloatingTag: &org_engine_registry_push
+    title: Push static tag to Artifact Registry
+    stage: org-engine
+    type: push
+    retry:
+      maxAttempts: 2
+    image_name: fr-pre-prod-registry/container-images/org-engine
+    candidate: ${{BuildEngineImage}}
+    tags:
+    - ${{STATIC_IMAGE_TAG}}
+    - ${{BUILD_NUMBER_TAG}}
+    registry: fr-pre-prod-registry-artifact-registry-write
+    when:
+      steps:
+      - name: ShouldAddFloatingTag
+        on:
+        - failure
+  PushEngineToDockerRegistryEuropeWithoutFloatingTag:
+    <<: *org_engine_registry_push
+    image_name: fr-pre-prod-registry/container-images-emea/org-engine
+    registry: fr-pre-prod-registry-emea
+  PushEngineToDockerRegistryAsiaWithoutFloatingTag:
+    <<: *org_engine_registry_push
+    image_name: fr-pre-prod-registry/container-images-apac/org-engine
+    registry: fr-pre-prod-registry-asia
+  AddOrgEngineTagToSaasRepo:
+    stage: org-engine
+    title: Add org-engine git tag to saas repo
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+    environment:
+    - BUILD_NUMBER_TAG=${{BUILD_NUMBER_TAG}}
+    - STATIC_TAG=${{STATIC_IMAGE_TAG}}
+    commands:
+    - apk --no-cache add curl
+    - >
+      curl "https://argo-workflows.orchestrator.forgerock.io/api/v1/events/argo/"
+      --header "Authorization:Bearer ${{ARGO_TOKEN}}"
+      --header "X-Argo-Orchestration-Git-Tag:true"
+      --data "{\"image\":\"org-engine\", \"static_tag\":\"${STATIC_TAG}\", \"build_number_tag\":\"${BUILD_NUMBER_TAG}\"}"
+    when:
+      steps:
+      - name: BuildEngineImage
+        on:
+        - success
+      branch:
+        only:
+        - /(master|regular-candidate-.*)/
+  # Run some freestyle commands to gather info for Codefresh support ticket
+  GatherDiagnosticInfo:
+    title: Gather diagnostic
+    image: us-docker.pkg.dev/fr-pre-prod-registry/container-images/alpine:3.19.1@sha256:3ad671baa6c2c1536e7df9ceef4e5d57a2409df20d5aa27d97da64a2a30753d6
+    stage: diagnostics
+    no_cache: false
+    no_cf_cache: true
+    working_directory: /codefresh/volume/saas
+    commands:
+    - apk --no-cache add git
+    - git -P status
+    - git -P show
+    - cat /codefresh/volume/event.json || true
+    - df -h
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
